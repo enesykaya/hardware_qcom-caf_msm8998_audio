@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
  * Not a contribution.
  *
  * Copyright (C) 2013 The Android Open Source Project
@@ -167,11 +167,11 @@ int voice_stop_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     session->state.current = CALL_INACTIVE;
 
     /* Disable sidetone only when no calls are active */
-    if (!voice_is_call_state_active(adev))
+    if (!voice_is_call_state_active_in_call(adev))
         voice_set_sidetone(adev, uc_info->out_snd_device, false);
 
     /* Disable aanc only when no calls are active */
-    if (!voice_is_call_state_active(adev))
+    if (!voice_is_call_state_active_in_call(adev))
         voice_check_and_update_aanc_path(adev, uc_info->out_snd_device, false);
 
     ret = platform_stop_voice_call(adev->platform, session->vsid);
@@ -221,12 +221,18 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     uint32_t sample_rate = 8000;
     struct voice_session *session = NULL;
     struct pcm_config voice_config = pcm_config_voice_call;
+    bool is_in_call = (AUDIO_MODE_IN_CALL == adev->mode);
 
     ALOGD("%s: enter usecase:%s", __func__, use_case_table[usecase_id]);
 
     session = (struct voice_session *)voice_get_session_from_use_case(adev, usecase_id);
     if (!session) {
         ALOGE("start_call: couldn't find voice session");
+        return -EINVAL;
+    }
+
+    if (!adev->current_call_output) {
+        ALOGE("start_call: invalid current call output");
         return -EINVAL;
     }
 
@@ -239,11 +245,12 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     uc_info->id = usecase_id;
     uc_info->type = VOICE_CALL;
     uc_info->stream.out = adev->current_call_output;
-    uc_info->devices = adev->current_call_output->devices;
+    list_init(&uc_info->device_list);
+    assign_devices(&uc_info->device_list, &adev->current_call_output->device_list);
 
-    if (popcount(uc_info->devices) == 2) {
+    if (is_in_call && list_length(&uc_info->device_list) == 2) {
         ALOGE("%s: Invalid combo device(%#x) for voice call", __func__,
-              uc_info->devices);
+              get_device_types(&uc_info->device_list));
         ret = -EIO;
         goto error_start_voice;
     }
@@ -252,7 +259,7 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
     uc_info->out_snd_device = SND_DEVICE_NONE;
     adev->voice.use_device_mute = false;
 
-    if (audio_is_bluetooth_sco_device(uc_info->devices) && !adev->bt_sco_on) {
+    if (is_sco_out_device_type(&uc_info->device_list) && !adev->bt_sco_on) {
         ALOGE("start_call: couldn't find BT SCO, SCO is not ready");
         adev->voice.in_call = false;
         ret = -EIO;
@@ -360,11 +367,11 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
 #endif
 
     /* Enable aanc only when no calls are active */
-    if (!voice_is_call_state_active(adev))
+    if (!voice_is_call_state_active_in_call(adev))
         voice_check_and_update_aanc_path(adev, uc_info->out_snd_device, true);
 
     /* Enable sidetone only when no calls are already active */
-    if (!voice_is_call_state_active(adev))
+    if (!voice_is_call_state_active_in_call(adev))
         voice_set_sidetone(adev, uc_info->out_snd_device, true);
 
     voice_set_volume(adev, adev->voice.volume);
@@ -386,8 +393,10 @@ done:
     return ret;
 }
 
-bool voice_is_call_state_active(struct audio_device *adev)
-{
+/*
+* helper function to check whether call is active or not.
+*/
+static inline bool voice_is_active(struct audio_device *adev) {
     bool call_state = false;
     int ret = 0;
 
@@ -399,7 +408,29 @@ bool voice_is_call_state_active(struct audio_device *adev)
     return call_state;
 }
 
+/*
+* checks if call is active and in IN_CALL mode.
+*/
+bool voice_is_call_state_active_in_call(struct audio_device *adev)
+{
+    bool call_state = voice_is_active(adev);
+    return call_state && adev->mode == AUDIO_MODE_IN_CALL;
+}
+
+/*
+* returns true if call is active no matter what mode is.
+*/
+bool voice_is_call_state_active(struct audio_device *adev)
+{
+    return voice_is_active(adev);
+}
+
 bool voice_is_in_call(const struct audio_device *adev)
+{
+    return adev->voice.in_call && adev->mode == AUDIO_MODE_IN_CALL;
+}
+
+bool voice_is_in_call_or_call_screen(const struct audio_device *adev)
 {
     return adev->voice.in_call;
 }
@@ -441,7 +472,7 @@ bool voice_check_voicecall_usecases_active(struct audio_device *adev)
 
     list_for_each(node, &adev->usecase_list) {
         usecase = node_to_item(node, struct audio_usecase, list);
-        if (usecase->type == VOICE_CALL) {
+        if (usecase->type == VOICE_CALL && adev->mode != AUDIO_MODE_CALL_SCREEN) {
             ALOGV("%s: voice usecase:%s is active", __func__,
                    use_case_table[usecase->id]);
             return true;
@@ -747,7 +778,7 @@ int voice_set_parameters(struct audio_device *adev, struct str_parms *parms)
         if (tty_mode != adev->voice.tty_mode) {
             adev->voice.tty_mode = tty_mode;
             adev->acdb_settings = (adev->acdb_settings & TTY_MODE_CLEAR) | tty_mode;
-            if (voice_is_call_state_active(adev))
+            if (voice_is_call_state_active_in_call(adev))
                voice_update_devices_for_all_voice_usecases(adev);
         }
     }

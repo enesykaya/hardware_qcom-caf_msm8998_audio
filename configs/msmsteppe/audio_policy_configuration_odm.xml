@@ -21,7 +21,11 @@
     <!-- version section contains a “version” tag in the form “major.minor” e.g version=”1.0” -->
 
     <!-- Global configuration Decalaration -->
+<<<<<<< HEAD
     <globalConfiguration speaker_drc_enabled="true"/>
+=======
+    <globalConfiguration speaker_drc_enabled="true" call_screen_mode_supported="true"/>
+>>>>>>> 1c2ac59f82f65d04c3bd33a39b8f51f8bfec83d3
 
 
     <!-- Modules section:
